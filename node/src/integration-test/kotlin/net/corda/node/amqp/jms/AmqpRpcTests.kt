@@ -2,6 +2,7 @@ package net.corda.node.amqp.jms
 
 import net.corda.core.identity.CordaX500Name
 import net.corda.core.utilities.NetworkHostAndPort
+import net.corda.core.utilities.contextLogger
 import net.corda.coretesting.internal.configureTestSSL
 import net.corda.nodeapi.RPCApi
 import net.corda.nodeapi.internal.config.MutualSslConfiguration
@@ -9,25 +10,31 @@ import net.corda.services.messaging.SimpleMQClient
 import net.corda.testing.driver.DriverParameters
 import net.corda.testing.driver.NodeHandle
 import net.corda.testing.driver.driver
-import net.corda.testing.node.internal.FINANCE_CONTRACTS_CORDAPP
-import net.corda.testing.node.internal.FINANCE_WORKFLOWS_CORDAPP
 import org.apache.activemq.artemis.api.core.SimpleString
+import org.apache.activemq.artemis.jms.client.ActiveMQQueue
 import org.apache.qpid.jms.JmsConnectionFactory
-import org.apache.qpid.jms.JmsQueue
-import org.junit.Ignore
 import org.junit.Test
-import javax.jms.BytesMessage
+import java.lang.Exception
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import javax.jms.CompletionListener
 import javax.jms.ConnectionFactory
-import javax.jms.MessageConsumer
+import javax.jms.Message
 import javax.jms.Session
+import kotlin.test.assertTrue
 
-@Ignore
 class AmqpRpcTests {
-    private val CORDAPPS = listOf(FINANCE_CONTRACTS_CORDAPP, FINANCE_WORKFLOWS_CORDAPP) // TODO: Do we need CordApps at all?
+
+    companion object {
+        private val logger = contextLogger()
+
+        const val TAG_FIELD_NAME = "tag" // RPCApi.TAG_FIELD_NAME
+        const val RPC_REQUEST = 0// RPCApi.ClientToServer.Tag.RPC_REQUEST
+    }
 
     @Test(timeout=300_000)
     fun `RPC over AMQP`() {
-        driver(DriverParameters(notarySpecs = emptyList(), cordappsForAllNodes = CORDAPPS, extraCordappPackagesToScan = emptyList())) {
+        driver(DriverParameters(startNodesInProcess = true, notarySpecs = emptyList())) {
             val node = startNode().get()
             val connectionFactory: ConnectionFactory = JmsConnectionFactory("amqp://${node.rpcAddress}")
             val rpcUser = node.rpcUsers.first()
@@ -36,40 +43,55 @@ class AmqpRpcTests {
                 // Create a session
                 val session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE)
 
-                val clientQueueName = loginToRPCAndGetClientQueue(node)
-                val sender = session.createProducer(JmsQueue(clientQueueName))
-                //val message = session.createBytesMessage()
+                val sender = session.createProducer(ActiveMQQueue(RPCApi.RPC_SERVER_QUEUE_NAME))
 
-                /*
-                val serialisedArguments = emptyList().serialize(context = serializationContextWithObservableContext)
+                /*val serialisedArguments = emptyList<Unit>().serialize(context = AMQP_RPC_CLIENT_CONTEXT)
                 val request = RPCApi.ClientToServer.RpcRequest(
-                        clientAddress,
+                        SimpleString("foo"),
                         "currentNodeTime",
                         serialisedArguments,
-                        replyId,
-                        sessionId,
-                        externalTrace,
-                        impersonatedActor
-                )
-                 */
+                        Trace.InvocationId(),
+                        sessionId
+                )*/
 
-                sender.send(session.createTextMessage("Hello world "))
+                val message = session.createBytesMessage()
+                message.setIntProperty(TAG_FIELD_NAME, RPC_REQUEST )
+                //val message = session.createTextMessage("Hello, World!")
+
+                // Start connection
                 connection.start()
 
+                val latch = CountDownLatch(1)
+
+                sender.send(message, object : CompletionListener {
+                    override fun onException(message: Message, exception: Exception) {
+                        logger.error(message.toString(), exception)
+                    }
+
+                    override fun onCompletion(message: Message) {
+                        logger.info("Message successfully sent: $message")
+                        latch.countDown()
+                    }
+                })
+
+                assertTrue(latch.await(10, TimeUnit.SECONDS))
+                logger.info("Obtaining response")
+                /*
                 val receiveQueue = session.createQueue("")
                 val consumer: MessageConsumer = session.createConsumer(receiveQueue)
 
                 // Step 7. receive the simple message
                 /*val m = */consumer.receive(5000) as BytesMessage
+                */
             }
         }
     }
 
     private fun loginToRPCAndGetClientQueue(nodeHandle: NodeHandle): String {
         val rpcUser = nodeHandle.rpcUsers.first()
-        val clientQueueQuery = SimpleString("${RPCApi.RPC_CLIENT_QUEUE_NAME_PREFIX}.${rpcUser.username}.*")
         val client = clientTo(nodeHandle.rpcAddress)
         client.start(rpcUser.username, rpcUser.password, false)
+        val clientQueueQuery = SimpleString("${RPCApi.RPC_CLIENT_QUEUE_NAME_PREFIX}.${rpcUser.username}.*")
         return client.session.addressQuery(clientQueueQuery).queueNames.single().toString()
     }
 
